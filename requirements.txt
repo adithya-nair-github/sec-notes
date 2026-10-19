@@ -1,0 +1,5 @@
+requests>=2.31
+faster-whisper>=1.1.0
+yt-dlp>=2025.1.1
+pdfminer.six>=20231228
+playwright>=1.45
