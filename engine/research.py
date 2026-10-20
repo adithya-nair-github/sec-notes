@@ -9,7 +9,7 @@ plus turning everything the researcher found into engine signals.
 import datetime as dt
 import re
 
-VERSION = 3   # bump to make the runner re-read audit fees, 13Ds and financials
+VERSION = 4   # bump to make the runner re-read audit fees, 13Ds and financials
 
 # ------------------------------------------------------------ audit fees
 MONEY = r"\$?\s*\(?([\d]{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)\)?\s*(thousand|million|k\b)?"
@@ -45,9 +45,22 @@ def audit_fees(text):
             first_is_current = False  # header reads "2024 2025": the second column is current
         cur, prior = (a, b) if first_is_current else (b, a)
         ycur = max(yrs[-2:]) if len(yrs) >= 2 else None
-        return {"current": cur, "prior": prior, "year_cur": ycur, "year_prior": (ycur - 1) if ycur else None,
-                "change": (cur - prior) / prior if prior else None}
+        out = {"current": cur, "prior": prior, "year_cur": ycur, "year_prior": (ycur - 1) if ycur else None,
+               "change": (cur - prior) / prior if prior else None}
+        # A second, different "Audit Fees" row after this one usually means one table per audit firm (an auditor
+        # change): one firm's table alone makes the switch look like a jump (hand check 20 Oct: RenovoRx read +47%,
+        # real +7.6%). Fees are then not comparable, so report no change rather than a wrong one.
+        rest = text[m.end(): m.end() + 15000]
+        for m2 in AUDIT_ROW_ONE.finditer(rest):
+            v = _amount(m2.group(1), m2.group(2), table_unit)
+            if 10_000 <= v <= 500_000_000 and v not in (a, b):
+                out.update(change=None, several_tables=True)
+                break
+        return out
     return None
+
+
+AUDIT_ROW_ONE = re.compile(r"\baudit\s+fees\b(?:\s*\(\s*\d\s*\))?[^$\d]{0,60}" + MONEY, re.I)
 
 
 # ------------------------------------------------------------ activists
