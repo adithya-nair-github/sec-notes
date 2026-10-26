@@ -33,7 +33,17 @@ jobs:
         with:
           python-version: "3.11"
       - name: Tools
-        run: pip -q install requests
+        run: |
+          pip -q install requests
+          # CPU-only PyTorch (about 0.2 GB instead of 2+ GB with the GPU libraries) for the AI checks;
+          # if this fails the run still works, with the rules only
+          pip -q install torch --index-url https://download.pytorch.org/whl/cpu && \
+            pip -q install "sentence-transformers>=3.0" "transformers>=4.41" sentencepiece protobuf || \
+            echo "AI check libraries not installed: rules only this run"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/sec-notes-models   # AI check + meaning search models (downloaded once, then reused)
+          key: ai-models-v1
       - name: Run
         env:
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
@@ -43,7 +53,7 @@ jobs:
           cd data
           git config user.name "data-bot"
           git config user.email "data-bot@users.noreply.github.com"
-          for p in state/research output; do if [ -e "$p" ]; then git add -A "$p"; fi; done
+          for p in state/research state/judge_cache output; do if [ -e "$p" ]; then git add -A "$p"; fi; done
           git commit -q -m "research $(date -u +%F) part ${{ matrix.shard }}" || exit 0
           for i in 1 2 3 4 5 6 7 8; do
             if git pull -q --rebase && git push -q; then exit 0; fi
