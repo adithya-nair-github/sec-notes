@@ -21,6 +21,11 @@ recorded as "registration_required" and skipped; nothing is ever submitted on an
 The text is then read for finance pain, quote by quote, with who said it (CFO / CEO /
 management; analyst questions are never quoted as the company's words) and when.
 Every step records why it stopped, so the reports show where the funnel leaks.
+
+Optional AI checks (passed in by calls_run.py; without them the rules work alone):
+  engine/judge.py     a second check on every rule quote ("jv" stamp on the call record)
+  engine/semantic.py  finance pain said in other words -> call_semantic_pain ("sem" finds, "sv" stamp)
+Calls already done get both from their saved transcript (reread_event), so VERSION does not need a bump.
 """
 import datetime as dt
 import gzip
@@ -680,21 +685,38 @@ def attribute(segments, cfo_name="", ceo_name=""):
 
 
 # ============================================================ reading the call
-def analyze(attributed, max_per_type=2):
-    """Quotes of finance pain from management. [{type, quote, at, part, speaker}]"""
-    qa_at = None
+# text sources whose words are exact (quotes can be used word for word); audio / captions are machine transcripts
+EXACT_KINDS = ("sec_transcript", "sec_remarks", "ir_transcript", "ir_remarks", "hf_transcript", "own_transcript")
+JUDGE_CAP = 10   # rule candidates judged per type and call (more are only counted)
+
+
+def qa_index(attributed):
+    """Index of the segment where the Q&A starts, or None."""
     early = max(3, len(attributed) // 4)
     for i, (sec, text, *_r) in enumerate(attributed):
         if NEXT_QUESTION.search(text) or (i >= early and QA_START.search(text) and not QA_FUTURE.search(text)):
-            qa_at = i
-            break
-    hits, counts, topics = [], {}, {}
+            return i
+    return None
+
+
+def clean_sentences(text):
+    """A segment's sentences, without the spoken lead-ins ("Yeah, so ...")."""
+    for s in re.split(r"(?<=[.;!?])\s+", text):
+        s = re.sub(r"^\s*(yeah|yes|sure|okay|ok|so|well|great|thanks|thank you)[,.!]?\s+", "", s, flags=re.I)
+        yield s[:1].upper() + s[1:]
+
+
+def analyze(attributed, max_per_type=2, judge=None, dropped=None):
+    """Quotes of finance pain from management. [{type, quote, at, part, speaker[, judge]}]
+    With a judge (engine/judge.py) every rule match gets a second check first; the ones it rejects are left
+    out (and listed in `dropped`), so the per-type cap only counts quotes that passed. No judge, or a judge
+    whose model is not available: exactly the rule behaviour."""
+    qa_at = qa_index(attributed)
+    found = []
     for i, (sec, text, role, label) in enumerate(attributed):
         if role in ("analyst", "operator"):
             continue
-        for s in re.split(r"(?<=[.;!?])\s+", text):
-            s = re.sub(r"^\s*(yeah|yes|sure|okay|ok|so|well|great|thanks|thank you)[,.!]?\s+", "", s, flags=re.I)
-            s = s[:1].upper() + s[1:]
+        for s in clean_sentences(text):
             if len(s) < 60 or len(s) > 500 or earnings.BOILERPLATE.search(s) or s.strip().endswith("?"):
                 continue
             for typ, rx in CALL_PATTERNS.items():
@@ -703,14 +725,125 @@ def analyze(attributed, max_per_type=2):
                     continue
                 if typ != "call_leadership" and NOT_OURS.search(s):
                     continue
-                topics[typ] = topics.get(typ, 0) + 1
-                if counts.get(typ, 0) >= max_per_type:
-                    continue
-                counts[typ] = counts.get(typ, 0) + 1
-                hits.append({"type": typ, "quote": s.strip()[:360], "at": sec,
-                             "part": "Q&A" if qa_at is not None and i >= qa_at else "prepared remarks",
-                             "speaker": role, "label": label})
+                found.append((i, sec, role, label, typ, s))
+    verdicts, per_type = None, {}
+    if judge is not None and found:
+        ask = []
+        for f in found:
+            per_type[f[4]] = per_type.get(f[4], 0) + 1
+            if per_type[f[4]] <= JUDGE_CAP:
+                ask.append(f)
+        got = judge.verdicts([(f[5].strip(), f[4]) for f in ask])
+        if got is not None:
+            verdicts = {id(f): v for f, v in zip(ask, got)}
+    hits, counts, topics = [], {}, {}
+    for f in found:
+        i, sec, role, label, typ, s = f
+        part = "Q&A" if qa_at is not None and i >= qa_at else "prepared remarks"
+        v = verdicts.get(id(f)) if verdicts is not None else None
+        if verdicts is not None and v is None:      # beyond the judging cap: counted, never quoted
+            topics[typ] = topics.get(typ, 0) + 1
+            continue
+        if v is not None and not v["keep"]:
+            if dropped is not None:
+                dropped.append({"type": typ, "quote": s.strip()[:300], "part": part, "speaker": role,
+                                "judge": {k: v[k] for k in ("score", "neg", "label", "keep")}})
+            continue
+        topics[typ] = topics.get(typ, 0) + 1
+        if counts.get(typ, 0) >= max_per_type:
+            continue
+        counts[typ] = counts.get(typ, 0) + 1
+        hit = {"type": typ, "quote": s.strip()[:360], "at": sec, "part": part, "speaker": role, "label": label}
+        if v is not None:
+            hit["judge"] = {k: v[k] for k in ("score", "neg", "label", "keep")}
+        hits.append(hit)
     return hits, topics
+
+
+def finish_hits(items, src_kind):
+    """Quotes from text sources are exact; prepared-remarks documents have no Q&A."""
+    for h in items:
+        h.setdefault("verified", src_kind in EXACT_KINDS)
+        if src_kind.endswith("remarks"):
+            h["part"] = "prepared remarks"
+    return items
+
+
+def rejudge_hits(hits, judge):
+    """Judge stored quotes in place (machine-transcript calls keep their re-transcribed quotes). False if unavailable."""
+    if not hits:
+        return True
+    vs = judge.verdicts([(h["quote"], h["type"]) for h in hits])
+    if vs is None:
+        return False
+    for h, v in zip(hits, vs):
+        h["judge"] = {k: v[k] for k in ("score", "neg", "label", "keep")}
+    return True
+
+
+# saved transcript line: "[12:34] (Jane Smith — CFO) text" or "(management) text"
+SAVED_LINE = re.compile(r"^(?:\[(\d+):(\d\d)(?::(\d\d))?\] )?\((.*?)\) (.*)$")
+ROLE_WORDS = {"cfo", "ceo", "management", "analyst", "operator"}
+
+
+def segments_from_saved(text):
+    """The segments of a transcript saved by save_transcript, ready for attribute() again.
+    Lines carry the speaker label when there was one, else the role attribute() gave: a bare role is turned back
+    into "no label", so attribute() re-derives exactly the same roles from the same text."""
+    segs = []
+    for line in (text or "").split("\n"):
+        m = SAVED_LINE.match(line)
+        if not m:
+            if segs and line.strip():
+                segs[-1] = (segs[-1][0], segs[-1][1] + " " + line.strip(), segs[-1][2])
+            continue
+        a, b, c, who, body = m.groups()
+        sec = None if a is None else (int(a) * 3600 + int(b) * 60 + int(c) if c else int(a) * 60 + int(b))
+        segs.append((sec, body, "" if who in ROLE_WORDS else who))
+    return segs
+
+
+def needs_reread(rec, judge=None, semantic=None):
+    """A finished call that the (available) judge or meaning search has not read at their current settings."""
+    if rec.get("stage") != "done":
+        return False
+    if judge is not None and rec.get("jv") != judge.signature and judge.available:
+        return True
+    return semantic is not None and rec.get("sv") != semantic.signature and semantic.available
+
+
+def reread_event(rec, text, cfo_name="", ceo_name="", judge=None, semantic=None):
+    """Second check + meaning search for a call we already have, from its saved transcript (no download,
+    no speech-to-text). Text sources are read again with the judge (same rules, same text); machine-transcript
+    calls keep their re-transcribed quotes and only those are judged. True if the record changed."""
+    kind = (rec.get("source") or {}).get("kind", "")
+    attributed = attribute(segments_from_saved(text), cfo_name, ceo_name) if text else None
+    changed = False
+    if judge is not None and rec.get("jv") != judge.signature and judge.available:
+        ok = True
+        if attributed and not kind.startswith("audio_"):
+            dropped = []
+            hits, topics = analyze(attributed, judge=judge, dropped=dropped)
+            if judge.available:
+                rec["hits"], rec["topics"] = finish_hits(hits, kind), topics
+                if dropped:
+                    rec["judged_out"] = dropped[:6]
+                else:
+                    rec.pop("judged_out", None)
+            else:
+                ok = False
+        else:
+            ok = rejudge_hits(rec.get("hits", []), judge)
+        if ok:
+            rec["jv"] = judge.signature
+            changed = True
+    if semantic is not None and rec.get("sv") != semantic.signature and semantic.available:
+        found = semantic.scan_call(attributed) if attributed else []
+        if found is not None:
+            rec["sem"] = finish_hits(found, kind)
+            rec["sv"] = semantic.signature
+            changed = True
+    return changed
 
 
 def cfo_excerpt(attributed, limit=1500):
@@ -801,8 +934,9 @@ def filing_index(cik, adsh):
 
 # ============================================================ one event, start to finish
 def process_event(http, ev, outdir, cfo_name="", ceo_name="", model="base.en", fix_model="small.en",
-                  use_browser=True, use_youtube_search=True, deps=None):
-    """ev = {cik, company, adsh, date, followups:[adsh], domain}. Returns a record that says how far it got."""
+                  use_browser=True, use_youtube_search=True, deps=None, judge=None, semantic=None):
+    """ev = {cik, company, adsh, date, followups:[adsh], domain}. Returns a record that says how far it got.
+    judge / semantic (engine/judge.py, engine/semantic.py) are optional; without them the rules work alone."""
     d = deps or {}
     browser = d.get("browser", browser_media)
     render = d.get("render", render_page) if use_browser else None
@@ -925,7 +1059,8 @@ def process_event(http, ev, outdir, cfo_name="", ceo_name="", model="base.en", f
         return rec, None
 
     attributed = attribute(segs, cfo_name, ceo_name)
-    hits, topics = analyze(attributed)
+    dropped = []
+    hits, topics = analyze(attributed, judge=judge, dropped=dropped)
     # accurate re-pass of the kept quotes (audio only)
     if audio_path and fix:
         for h in hits:
@@ -939,14 +1074,19 @@ def process_event(http, ev, outdir, cfo_name="", ceo_name="", model="base.en", f
                     if CALL_PATTERNS[h["type"]].search(s):
                         h["quote"], h["verified"] = s.strip()[:360], True
                         break
-    for h in hits:
-        h.setdefault("verified", src["kind"] in ("sec_transcript", "sec_remarks", "ir_transcript", "ir_remarks", "hf_transcript", "own_transcript"))
-        if src["kind"].endswith("remarks"):
-            h["part"] = "prepared remarks"
+    finish_hits(hits, src["kind"])
     _cleanup(audio_path)
     rec.update(stage="done", source=src, hits=hits, topics=topics, cfo_excerpt=cfo_excerpt(attributed),
                minutes=round((segs[-1][0] or 0) / 60) if segs and segs[-1][0] is not None else None,
                words=sum(len(s[1].split()) for s in segs))
+    if judge is not None and judge.available:
+        rec["jv"] = judge.signature
+        if dropped:
+            rec["judged_out"] = dropped[:6]
+    if semantic is not None:
+        found = semantic.scan_call(attributed)
+        if found is not None:
+            rec["sem"], rec["sv"] = finish_hits(found, src["kind"]), semantic.signature
     lines = []
     for sec, text, role, label in attributed:
         lines.append(f"[{mmss(sec)}] ({label or role}) {text}" if sec is not None else f"({label or role}) {text}")
@@ -966,40 +1106,64 @@ LABEL_DATE = {1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr", 5: "May", 6: "Jun", 7: "Ju
 SPEAKER_WORD = {"cfo": "the CFO", "ceo": "the CEO", "management": "management"}
 
 
-def signals_for_company(doc, today, window_days=150):
+def _kept(h):
+    """False only for a quote the judge (engine/judge.py) dropped."""
+    return (h.get("judge") or {}).get("keep") is not False
+
+
+def _raised(e, typ):
+    """The call raised this topic (and the judge did not reject every quote of it)."""
+    if typ not in (e.get("topics") or {}):
+        return False
+    hs = [h for h in e.get("hits", []) if h["type"] == typ]
+    return not hs or any(_kept(h) for h in hs)
+
+
+def _call_detail(doc, r, h, extra=""):
+    y, m, d_ = r["date"][:4], int(r["date"][5:7]), int(r["date"][8:10])
+    who = SPEAKER_WORD.get(h.get("speaker"), "management")
+    if h.get("speaker") == "cfo" and doc.get("cfo_name"):
+        who = f"the CFO, {doc['cfo_name']}"
+    when = f"{LABEL_DATE[m]} {d_}, {y}"
+    where = f"{h['part']}" + (f", {mmss(h['at'])}" if h.get("at") is not None else "")
+    exact = "" if h.get("verified") else " [machine transcript: paraphrase, don't quote word for word]"
+    q = h["quote"].rstrip(" .;")
+    src_kind = (r.get("source") or {}).get("kind", "")
+    if src_kind.endswith("remarks"):
+        return f"In its prepared remarks for the {when} earnings call, {who} said: \"{q}.\"{extra}{exact}"
+    return f"On its {when} earnings call ({where}), {who} said: \"{q}.\"{extra}{exact}"
+
+
+def signals_for_company(doc, today, window_days=150, semantic_max=1):
     """Engine signals from one company's call file: one per topic, from the newest call that raised it,
-    with how many of the last calls raised it. Only calls inside the window count."""
+    with how many of the last calls raised it. Only calls inside the window count. Quotes the judge dropped
+    are skipped. Plus at most `semantic_max` call_semantic_pain (pain in other words, engine/semantic.py)."""
     import datetime as dt
     events = sorted((r for r in doc.get("events", {}).values() if r.get("stage") == "done"), key=lambda r: r["date"], reverse=True)
     if not events:
         return []
     cutoff = (today - dt.timedelta(days=window_days)).isoformat()
+    recent = [r for r in events if r["date"] >= cutoff]
     out, used = [], set()
-    for r in events:
-        if r["date"] < cutoff:
-            break
+    for r in recent:
         for h in r.get("hits", []):
-            if h["type"] in used:
+            if h["type"] in used or not _kept(h):
                 continue
             used.add(h["type"])
-            n_calls = sum(1 for e in events if h["type"] in (e.get("topics") or {}))
-            y, m, d_ = r["date"][:4], int(r["date"][5:7]), int(r["date"][8:10])
-            who = SPEAKER_WORD.get(h.get("speaker"), "management")
-            if h.get("speaker") == "cfo" and doc.get("cfo_name"):
-                who = f"the CFO, {doc['cfo_name']}"
-            when = f"{LABEL_DATE[m]} {d_}, {y}"
-            where = f"{h['part']}" + (f", {mmss(h['at'])}" if h.get("at") is not None else "")
-            exact = "" if h.get("verified") else " [machine transcript: paraphrase, don't quote word for word]"
+            n_calls = sum(1 for e in events if _raised(e, h["type"]))
             repeat = f" Raised on {n_calls} of the {len(events)} recent calls we have transcripts for." if n_calls > 1 else ""
-            q = h["quote"].rstrip(" .;")
-            src_kind = (r.get("source") or {}).get("kind", "")
-            if src_kind.endswith("remarks"):
-                detail = f"In its prepared remarks for the {when} earnings call, {who} said: \"{q}.\"{repeat}{exact}"
-            else:
-                detail = f"On its {when} earnings call ({where}), {who} said: \"{q}.\"{repeat}{exact}"
             src = r.get("source") or {}
             out.append({"type": h["type"], "cik": doc["cik"], "company": doc.get("company", ""), "date": r["date"],
-                        "detail": detail, "url": at_url(src.get("url", ""), h.get("at")), "ref": "state",
+                        "detail": _call_detail(doc, r, h, repeat), "url": at_url(src.get("url", ""), h.get("at")), "ref": "state",
+                        "source": "Earnings call"})
+    if semantic_max and any(r.get("sem") for r in recent):
+        from . import semantic
+        rule_quotes = [h["quote"] for e in events for h in e.get("hits", []) + e.get("judged_out", [])]
+        for r, f in semantic.pick([(r, r.get("sem")) for r in recent], used, rule_quotes, semantic_max):
+            extra = f" Theme: {semantic.theme_label(f['theme'])} (found by meaning, similarity {f['sim']:.2f})."
+            src = r.get("source") or {}
+            out.append({"type": "call_semantic_pain", "cik": doc["cik"], "company": doc.get("company", ""), "date": r["date"],
+                        "detail": _call_detail(doc, r, f, extra), "url": at_url(src.get("url", ""), f.get("at")), "ref": "state",
                         "source": "Earnings call"})
     return out
 

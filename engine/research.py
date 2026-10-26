@@ -208,8 +208,9 @@ FILING_LABEL = {
 SECTION_NAME = {"mdna": "MD&A", "controls": "Controls and Procedures", "risk": "Risk Factors", "business": "Business"}
 
 
-def signals_for_company(doc, today, window_days=420):
-    """Engine-ready signals from one company's research file (dates are the filing dates)."""
+def signals_for_company(doc, today, window_days=420, semantic_max=1):
+    """Engine-ready signals from one company's research file (dates are the filing dates).
+    Filing quotes the AI check dropped are skipped; plus at most `semantic_max` filing_semantic_pain."""
     out = []
     cik, name = doc["cik"], doc.get("company", "")
     cutoff = (today - dt.timedelta(days=window_days)).isoformat()
@@ -222,7 +223,7 @@ def signals_for_company(doc, today, window_days=420):
     used = set()
     for adsh, f in fs:
         for typ, h in (f.get("hits") or {}).items():
-            if typ in used:
+            if typ in used or (h.get("judge") or {}).get("keep") is False:
                 continue
             if typ != "filing_erp_project":
                 ok = adsh == newest or (h.get("section") == "risk" and adsh == newest_10k)
@@ -236,6 +237,16 @@ def signals_for_company(doc, today, window_days=420):
                 label = "says it recently finished moving to a new ERP / finance system"
             out.append({"type": typ, "cik": cik, "company": name, "date": f["date"],
                         "detail": f"Its {f['form']} filed {f['date']} ({SECTION_NAME.get(h.get('section'), h.get('section'))}) {label}: \"{h['quote'].rstrip(' .;')}.\"",
+                        "url": f.get("url", ""), "ref": "state", "source": "SEC filing text"})
+    # pain said in other words (engine/semantic.py): newest filing first, never a theme or quote the rules already cover
+    if semantic_max and any(f.get("sem") for _a, f in fs):
+        from . import semantic
+        rule_quotes = [h.get("quote", "") for _a, f in fs for h in list((f.get("hits") or {}).values()) + f.get("judged_out", [])]
+        for f, s in semantic.pick([(f, f.get("sem")) for _a, f in fs], used, rule_quotes, semantic_max):
+            out.append({"type": "filing_semantic_pain", "cik": cik, "company": name, "date": f["date"],
+                        "detail": f"Its {f['form']} filed {f['date']} ({SECTION_NAME.get(s.get('section'), s.get('section'))}) says: "
+                                  f"\"{s['quote'].rstrip(' .;')}.\" Theme: {semantic.theme_label(s['theme'])} "
+                                  f"(found by meaning, similarity {s['sim']:.2f}).",
                         "url": f.get("url", ""), "ref": "state", "source": "SEC filing text"})
     a = doc.get("audit") or {}
     if (a.get("change") is not None and 0.20 <= a["change"] <= 3.0 and a["prior"] >= 100_000 and a["current"] - a["prior"] >= 100_000

@@ -117,13 +117,21 @@ def erp_is_real(s, year=None):
     return True
 
 
-def read_filing(raw_html, form, year=None):
-    """{hits:{type:{quote, section[, status]}}, employees:int|None, fees_text:str}"""
+JUDGE_CANDIDATES = 6   # with the AI check on, up to this many rule matches per type are judged (first kept one wins)
+
+
+def read_filing(raw_html, form, year=None, judge=None, keep_sections=False):
+    """{hits:{type:{quote, section[, status][, judge]}}, employees:int|None, fees_text:str[, judged_out][, sections]}
+    judge (engine/judge.py): the first rule match per type that the judge keeps wins; rejected ones are listed
+    in judged_out. No judge, or its model not available: exactly the rule behaviour (first match wins).
+    keep_sections: also return the MD&A / Controls / Risk Factors text for the meaning search (engine/semantic.py)."""
     text = eightk.to_text(raw_html or "")
     secs = SECTIONS_10K if form.startswith("10-K") else SECTIONS_10Q
     parts = {k: section(text, p) for k, p in secs.items()}
-    hits = {}
+    want = JUDGE_CANDIDATES if judge is not None else 1
+    cands = []
     for typ, (rx, where) in FILING_PATTERNS.items():
+        n = 0
         for sec in where:
             for s in sentences(parts.get(sec, "")):
                 m = rx.search(s)
@@ -133,12 +141,26 @@ def read_filing(raw_html, form, year=None):
                     continue
                 if typ in ("filing_lean_accounting", "filing_outsourced_reporting") and re.match(r"\s*if\b", s, re.I):
                     continue
-                hits[typ] = {"quote": s[:420], "section": sec}
-                if typ == "filing_erp_project":
-                    hits[typ]["status"] = "done" if DONE.search(s) and not IN_PROGRESS.search(s) else "in_progress"
+                cands.append((typ, s, sec))
+                n += 1
+                if n >= want:
+                    break
+            if n >= want:
                 break
-            if typ in hits:
-                break
+    verdicts = judge.verdicts([(s[:420], typ) for typ, s, _sec in cands]) if judge is not None and cands else None
+    hits, judged_out = {}, []
+    for k, (typ, s, sec) in enumerate(cands):
+        if typ in hits:
+            continue
+        v = verdicts[k] if verdicts else None
+        if v is not None and not v["keep"]:
+            judged_out.append({"type": typ, "quote": s[:300], "section": sec, "judge": dict(v)})
+            continue
+        hits[typ] = {"quote": s[:420], "section": sec}
+        if typ == "filing_erp_project":
+            hits[typ]["status"] = "done" if DONE.search(s) and not IN_PROGRESS.search(s) else "in_progress"
+        if v is not None:
+            hits[typ]["judge"] = dict(v)
     emp = None
     m = EMPLOYEES.search(parts.get("business", "")) if parts.get("business") else None
     if m:
@@ -146,7 +168,26 @@ def read_filing(raw_html, form, year=None):
             emp = int(m.group(1).replace(",", ""))
         except ValueError:
             emp = None
-    return {"hits": hits, "employees": emp, "fees_text": parts.get("fees", "")[:20000]}
+    out = {"hits": hits, "employees": emp, "fees_text": parts.get("fees", "")[:20000]}
+    if judged_out:
+        out["judged_out"] = judged_out[:6]
+    if keep_sections:
+        out["sections"] = {k: parts.get(k, "") for k in ("mdna", "controls", "risk")}
+    return out
+
+
+def rejudge(frec, judge):
+    """Judge the stored quotes of a filing already read (no download). A rejected quote stays, marked keep=False
+    (signals skip it). True when done, False when the judge is not available."""
+    hits = frec.get("hits") or {}
+    items = [(h["quote"], typ) for typ, h in hits.items()]
+    vs = judge.verdicts(items) if items else []
+    if vs is None:
+        return False
+    for (_q, typ), v in zip(items, vs):
+        hits[typ]["judge"] = dict(v)
+    frec["jv"] = judge.signature
+    return True
 
 
 SECTION_NAME = {"mdna": "MD&A", "controls": "Controls and Procedures", "risk": "Risk Factors", "business": "Business"}
