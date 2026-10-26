@@ -5,6 +5,12 @@ Writes state/research/<cik>.json (with ready-made "signals") and output/research
 into the private repo. The public log prints counts only.
 
   python research_run.py --data data --shard 0 --shards 6
+
+AI checks (on by default, --no-judge / --no-semantic to switch off; they fail open if the models can't load):
+  engine/judge.py     second check on every 10-K / 10-Q rule quote
+  engine/semantic.py  finance pain said in other words (filing_semantic_pain)
+A filing already read is judged again from its stored quotes (no download); the meaning search needs the text,
+so each kept 10-K / 10-Q is downloaded once more the first time it runs (then once per new filing).
 """
 import argparse
 import datetime as dt
@@ -13,7 +19,7 @@ import os
 import time
 
 from calls_run import load, watchlist, watchlist_rows
-from engine import ats, edgar, filings, research
+from engine import ats, edgar, filings, research, semantic
 from engine import http as httpmod
 
 UA = os.environ.get("SEC_USER_AGENT") or "research-bot contact@example.com"
@@ -32,10 +38,13 @@ def main():
     ap.add_argument("--budget-min", type=int, default=320)
     ap.add_argument("--max-companies", type=int, default=100000)
     ap.add_argument("--facts-every-days", type=int, default=30)
+    semantic.add_args(ap)
     a = ap.parse_args()
     t0, today = time.time(), dt.date.today()
     D = a.data
     http = httpmod.Http(UA)
+    J, S = semantic.build(a, D, "research", a.shard, today)
+    sem_max = S.max_per_company if S else 0
     watch = watchlist(D)
     rows = watchlist_rows(D)
     private_boards = load(os.path.join(D, "state", "job_boards.json"), {})
@@ -73,18 +82,34 @@ def main():
         latest_10k_text = None
         for f in tenk + tenq:
             adsh = f["accessionNumber"]
-            if adsh in doc["filings"] and doc["filings"][adsh].get("v") == filings.VERSION:
+            old = doc["filings"].get(adsh)
+            fresh = bool(old) and old.get("v") == filings.VERSION
+            # the meaning search needs the text: read again once if this filing was never scanned at these settings
+            want_sem = S is not None and (not old or old.get("sv") != S.signature) and S.available
+            if fresh and not want_sem:
+                if J is not None and old.get("jv") != J.signature and J.available and filings.rejudge(old, J):
+                    bump("ai_rejudged_filings")
                 continue
             raw = http.get(doc_url(cik, f))
             if not raw:
                 bump("filing_fetch_failed")
                 continue
-            r = filings.read_filing(raw, f["form"], year=int(f["filingDate"][:4]))
+            r = filings.read_filing(raw, f["form"], year=int(f["filingDate"][:4]), judge=J, keep_sections=S is not None)
             fees_text = r.pop("fees_text", "")
+            sections = r.pop("sections", None)
             if f["form"] == "10-K":
                 latest_10k_text = fees_text
-            doc["filings"][adsh] = {"form": f["form"], "date": f["filingDate"], "url": doc_url(cik, f), "v": filings.VERSION, **r}
+            rec = {"form": f["form"], "date": f["filingDate"], "url": doc_url(cik, f), "v": filings.VERSION, **r}
+            if J is not None and J.available:
+                rec["jv"] = J.signature
+            if S is not None and sections is not None:
+                found = S.scan_filing(sections)
+                if found is not None:
+                    rec["sem"], rec["sv"] = found, S.signature
+                    bump("ai_semantic_found", len(found))
+            doc["filings"][adsh] = rec
             bump("filings_read")
+            bump("ai_judge_dropped", len(r.get("judged_out", [])))
             for typ in r["hits"]:
                 bump(typ)
         keep = {f["accessionNumber"] for f in tenk + tenq}
@@ -161,14 +186,22 @@ def main():
             doc["jobs"] = j
 
         sig_doc = dict(doc, activists=doc["activists_signal"])
-        doc["signals"] = research.signals_for_company(sig_doc, today) + job_sigs
+        doc["signals"] = research.signals_for_company(sig_doc, today, semantic_max=sem_max) + job_sigs
         doc["updated"] = today.isoformat()
         json.dump(doc, open(path, "w"), indent=1)
-        if doc["signals"]:
+        dropped = [f"- [dropped by AI check {j['judge']['score']:.2f} {j['judge']['label']}] {j['type']} ({ff['form']} {ff['date']}): \"{j['quote']}\""
+                   for ff in doc["filings"].values() for j in ff.get("judged_out", [])]
+        dropped += [f"- [dropped by AI check {h['judge']['score']:.2f} {h['judge']['label']}] {t} ({ff['form']} {ff['date']}): \"{h['quote']}\""
+                    for ff in doc["filings"].values() for t, h in (ff.get("hits") or {}).items() if (h.get("judge") or {}).get("keep") is False]
+        if doc["signals"] or dropped:
             lines.append(f"## {company}")
             lines += [f"- [{s['type']}] {s['detail']} {s['url']}" for s in doc["signals"]]
+            lines += dropped
             lines.append("")
 
+    if J:
+        J.save_cache()
+        bump("ai_judge_cached", J.stats["cached"])
     mins = round((time.time() - t0) / 60)
     head = [f"# Filings research {today} · shard {a.shard + 1} of {a.shards}", f"{done} companies checked in {mins} min."]
     head += [f"- {k}: {v}" for k, v in sorted(counts.items())] + [""]

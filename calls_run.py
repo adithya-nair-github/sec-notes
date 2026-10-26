@@ -13,16 +13,22 @@ Modes
   weekly    earnings 8-Ks from the last 21 days not done yet, plus one retry of recent misses
   backfill  every earnings 8-K of the last ~13 months (4 calls per company), best companies first
 Rolling window: each company keeps its newest 4 calls; older ones and their transcripts are dropped.
+
+AI checks (on by default, --no-judge / --no-semantic to switch off; they fail open if the models can't load):
+  engine/judge.py     second check on every rule quote (drops look-alikes)
+  engine/semantic.py  finance pain said in other words (call_semantic_pain)
+Calls already done are checked from their saved transcripts (no download, no speech-to-text), once per settings version.
 """
 import argparse
 import csv
 import datetime as dt
+import gzip
 import json
 import os
 import re
 import time
 
-from engine import calls, edgar, http as httpmod
+from engine import calls, edgar, semantic, http as httpmod
 
 UA = os.environ.get("SEC_USER_AGENT") or "research-bot contact@example.com"
 
@@ -100,11 +106,15 @@ def main():
     ap.add_argument("--keep", type=int, default=4)
     ap.add_argument("--no-browser", action="store_true")
     ap.add_argument("--no-dataset", action="store_true")
+    semantic.add_args(ap)
     a = ap.parse_args()
 
     t0, today = time.time(), dt.date.today()
     D = a.data
     http = httpmod.Http(UA)
+    J, S = semantic.build(a, D, "calls", a.shard, today)
+    sem_max = S.max_per_company if S else 0
+    n_reread, reread_lines = 0, []
     watch = watchlist(D)
     rows = watchlist_rows(D)
     signals = load(os.path.join(D, "state", "signals.json"), {})
@@ -173,7 +183,8 @@ def main():
             n_events += 1
             try:
                 rec, text = calls.process_event(http, ev, "/tmp/calls", cfo_name=doc["cfo_name"], ceo_name=sg.get("ceo", ""),
-                                                model=a.model, fix_model=a.fix_model, use_browser=not a.no_browser)
+                                                model=a.model, fix_model=a.fix_model, use_browser=not a.no_browser,
+                                                judge=J, semantic=S)
             except Exception as e:  # one bad call never stops the shard
                 rec, text = {"cik": cik, "adsh": ev["adsh"], "date": ev["date"], "stage": "error", "error": str(e)[:200], "hits": []}, None
             rec["tries"] = (old or {}).get("tries", 0) + 1
@@ -197,7 +208,28 @@ def main():
                     lines.append("Tried: " + " | ".join(rec["tried"][:8]))
             for h in rec.get("hits", []):
                 lines.append(f"- [{calls.mmss(h['at'])} {h['part']}, {h['speaker']}{', verified' if h.get('verified') else ''}] {h['type']}: \"{h['quote']}\"")
+            lines += ai_lines(rec)
             lines.append("")
+        # calls we already have: AI check + meaning search from the saved transcript (no download, no speech-to-text)
+        if a.mode != "pilot" and (J or S):
+            for adsh, r in sorted(doc["events"].items(), key=lambda kv: kv[1].get("date", ""), reverse=True):
+                if (time.time() - t0) / 60 > a.budget_min:
+                    break
+                if not calls.needs_reread(r, J, S):
+                    continue
+                text = ""
+                if r.get("transcript_file"):
+                    try:
+                        with gzip.open(os.path.join(D, r["transcript_file"]), "rt", encoding="utf-8") as fh:
+                            text = fh.read()
+                    except (OSError, EOFError):
+                        text = ""
+                if calls.reread_event(r, text, doc["cfo_name"], sg.get("ceo", ""), judge=J, semantic=S):
+                    changed = True
+                    n_reread += 1
+                    extra = ai_lines(r)
+                    if extra:
+                        reread_lines += [f"## {company} ({r['date']}): rechecked", *extra, ""]
         if changed or "cfo_name" in doc:
             # make tries relative to absolute data dir for prune
             for r in doc["events"].values():
@@ -210,16 +242,21 @@ def main():
                 del doc["events"][adsh]
             for r in doc["events"].values():
                 r.pop("_abs", None)
-            doc["signals"] = calls.signals_for_company(doc, today)  # ready-made for the private engine
+            doc["signals"] = calls.signals_for_company(doc, today, semantic_max=sem_max)  # ready-made for the private engine
             doc["updated"] = today.isoformat()
             json.dump(doc, open(path, "w"), indent=1)
 
+    if J:
+        J.save_cache()
+    ai = ai_counts(J, S, n_reread)
     mins = round((time.time() - t0) / 60)
     head = [f"# Earnings-call run {today} · mode {a.mode} · shard {a.shard + 1} of {a.shards}",
             f"{n_events} calls tried in {mins} min. Where each one ended:"]
     head += [f"- {k}: {v}" for k, v in sorted(funnel.items(), key=lambda x: -x[1])]
     head += [f"- source_{k}: {v}" for k, v in sorted(sources.items())]
+    head += [f"- {k}: {v}" for k, v in ai.items()]
     head.append("")
+    lines += reread_lines
     notes = []
     if calls._HF["err"]:
         notes.append(f"- Transcript dataset problem: {calls._HF['err'][:160]}")
@@ -229,8 +266,34 @@ def main():
         head += ["## Notes"] + notes + [""]
     open(os.path.join(D, "output", f"calls_report_{a.mode}_shard{a.shard}.md"), "w").write("\n".join(head + lines))
     # public log: counts only, never company names or links
-    print(f"shard {a.shard + 1}/{a.shards} mode={a.mode}: {n_events} calls tried in {mins} min; " +
-          ", ".join(f"{k}={v}" for k, v in sorted(funnel.items())))
+    parts = [", ".join(f"{k}={v}" for k, v in sorted(funnel.items())), ", ".join(f"{k}={v}" for k, v in ai.items())]
+    print(f"shard {a.shard + 1}/{a.shards} mode={a.mode}: {n_events} calls tried in {mins} min; " + "; ".join(p for p in parts if p))
+
+
+def ai_lines(rec):
+    """Report lines (private report only) for what the AI checks did on one call."""
+    out = []
+    for f in rec.get("sem") or []:
+        out.append(f"- [semantic: {f['theme']}, similarity {f['sim']:.2f}, check {f['judge']['score']:.2f}; "
+                   f"{f['part']}, {f['speaker']}] \"{f['quote']}\"")
+    for d in rec.get("judged_out") or []:
+        out.append(f"- [dropped by AI check {d['judge']['score']:.2f} {d['judge']['label']}] {d['type']}: \"{d['quote']}\"")
+    for h in rec.get("hits") or []:
+        if (h.get("judge") or {}).get("keep") is False:
+            out.append(f"- [dropped by AI check {h['judge']['score']:.2f} {h['judge']['label']}] {h['type']}: \"{h['quote']}\"")
+    return out
+
+
+def ai_counts(J, S, n_reread):
+    """Counts for the report head and the public log (numbers only)."""
+    out = {}
+    if J:
+        out.update(ai_judge_kept=J.stats["kept"], ai_judge_dropped=J.stats["dropped"], ai_judge_cached=J.stats["cached"])
+    if S:
+        out["ai_semantic_found"] = S.stats["found"]
+    if J or S:
+        out["ai_rechecked_stored"] = n_reread
+    return out
 
 
 if __name__ == "__main__":

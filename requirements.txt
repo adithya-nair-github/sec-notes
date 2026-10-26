@@ -4,3 +4,10 @@ yt-dlp>=2025.1.1
 pdfminer.six>=20231228
 playwright>=1.45
 duckdb
+# AI quote check (engine/judge.py) and meaning search (engine/semantic.py), CPU only.
+# PyTorch is installed first by the workflows from the CPU-only index (much smaller than the default GPU build):
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers>=3.0
+transformers>=4.41
+sentencepiece
+protobuf
